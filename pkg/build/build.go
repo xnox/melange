@@ -739,8 +739,10 @@ func (b *Build) BuildPackage(ctx context.Context) error {
 
 	// In SPDX v3 there is dedicate field for this
 	// https://spdx.github.io/spdx-spec/v3.0/model/Build/Properties/configSourceUri/
-	log.Infof("adding external ref %s for ConfigFile", configFileRef)
-	externalRefs = append(externalRefs, *configFileRef)
+	if configFileRef != nil {
+		log.Infof("adding external ref %s for ConfigFile", configFileRef)
+		externalRefs = append(externalRefs, *configFileRef)
+	}
 
 	if b.EmptyWorkspace {
 		log.Infof("empty workspace requested")
