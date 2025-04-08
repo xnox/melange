@@ -29,6 +29,6 @@ func main() {
 
 	if err := cli.New().ExecuteContext(ctx); err != nil {
 		clog.Error(err.Error())
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
