@@ -91,7 +91,7 @@ jobs:
           - py3-pyelftools # Uses license-path
           - py3-supported-python
           - s3cmd
-          - subversion
+          - subversion # built with MELANGE_VERSIONED_SHLIB_DEPENDS=1 to exercise versioned pc: depends
           - sudo
           - tini
 
@@ -205,13 +205,13 @@ jobs:
       - if: matrix.runner == 'bubblewrap'
         env:
           MATRIX_PACKAGE: ${{ matrix.package }}
-          # Build jq with versioned shared library depends enabled, so that
-          # the presubmit demonstrates so-ver: dependency generation on a
-          # real package.  melange runs under sudo here, which resets the
+          # Build jq and subversion with versioned depends enabled, so that
+          # the presubmit demonstrates so-ver: and pc: dependency generation
+          # on real packages.  melange runs under sudo here, which resets the
           # environment, so the variable is handed to env(1) instead of being
           # set in the step environment.  Empty means "off", which is how
           # melange reads an unset variable.
-          MELANGE_SUDO_ENV: ${{ matrix.package == 'jq' && 'env MELANGE_VERSIONED_SHLIB_DEPENDS=1' || '' }}
+          MELANGE_SUDO_ENV: ${{ contains(fromJSON('["jq", "subversion"]'), matrix.package) && 'env MELANGE_VERSIONED_SHLIB_DEPENDS=1' || '' }}
         run: |
           make SHELL="/bin/bash" MELANGE="sudo ${MELANGE_SUDO_ENV} melange" MELANGE_RUNNER="bubblewrap" MELANGE_EXTRA_OPTS="--generate-provenance" package/"${MATRIX_PACKAGE}"
       - if: matrix.runner == 'bubblewrap'
@@ -247,7 +247,7 @@ jobs:
           MATRIX_PACKAGE: ${{ matrix.package }}
           # See the note on the bubblewrap build step.  melange is not run
           # under sudo here, so the step environment reaches it directly.
-          MELANGE_VERSIONED_SHLIB_DEPENDS: ${{ matrix.package == 'jq' && '1' || '' }}
+          MELANGE_VERSIONED_SHLIB_DEPENDS: ${{ contains(fromJSON('["jq", "subversion"]'), matrix.package) && '1' || '' }}
         run: |
           make \
             SHELL="/bin/bash" \
@@ -302,30 +302,44 @@ jobs:
           done
           ls -hal packages/x86_64/usr/bin/sudo
 
-      - name: Check package ${{ matrix.package }} for versioned shared library depends
-        if: matrix.package == 'jq'
+      - name: Check package ${{ matrix.package }} for versioned depends
+        if: contains(fromJSON('["jq", "subversion"]'), matrix.package)
+        env:
+          MATRIX_PACKAGE: ${{ matrix.package }}
         run: |
-          # jq links libonig and libc, and both providers publish versioned
-          # so-ver: provides, so building with
-          # MELANGE_VERSIONED_SHLIB_DEPENDS=1 should have produced matching
-          # versioned depends, e.g.:
+          # These packages were built with MELANGE_VERSIONED_SHLIB_DEPENDS=1,
+          # so the shared libraries they link against and the pkg-config
+          # packages their .pc files require should have picked up a
+          # constraint naming the version that satisfied them at build time:
           #
           #   depend = so:libonig.so.5
           #   depend = so-ver:libonig.so.5>=6.9.10-r4
+          #   depend = pc:sqlite3
+          #   depend = pc:sqlite3>=3.50.4-r0
           #
           # The dynamic linker is not special: ld-linux-*.so gets a versioned
           # depend too, from the PT_INTERP of every executable.
-          found=0
-          for pkg in packages/x86_64/jq-*.apk; do
+          sover=0
+          pcver=0
+          for pkg in packages/x86_64/"${MATRIX_PACKAGE}"-*.apk; do
             echo "=== ${pkg} ==="
             depends="$(tar -Oxzf "${pkg}" .PKGINFO 2>/dev/null | grep '^depend = ' || true)"
             echo "${depends:-(no depends)}"
             if echo "${depends}" | grep -q '^depend = so-ver:'; then
-              found=1
+              sover=1
+            fi
+            if echo "${depends}" | grep -q '^depend = pc:.*>='; then
+              pcver=1
             fi
           done
-          if [ "${found}" -ne 1 ]; then
-            echo "::error::MELANGE_VERSIONED_SHLIB_DEPENDS=1 produced no so-ver: depends for jq"
+          if [ "${sover}" -ne 1 ]; then
+            echo "::error::MELANGE_VERSIONED_SHLIB_DEPENDS=1 produced no so-ver: depends for ${MATRIX_PACKAGE}"
+            exit 1
+          fi
+          # jq's libjq.pc requires no other pkg-config packages; subversion-dev
+          # is the one that depends on pc:apr-1, pc:serf-1, pc:sqlite3 and co.
+          if [ "${MATRIX_PACKAGE}" = "subversion" ] && [ "${pcver}" -ne 1 ]; then
+            echo "::error::MELANGE_VERSIONED_SHLIB_DEPENDS=1 produced no versioned pc: depends for ${MATRIX_PACKAGE}"
             exit 1
           fi
 
