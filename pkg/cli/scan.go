@@ -18,8 +18,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"slices"
@@ -30,9 +32,11 @@ import (
 
 	"chainguard.dev/apko/pkg/apk/apk"
 	"chainguard.dev/apko/pkg/apk/expandapk"
+	apko_types "chainguard.dev/apko/pkg/build/types"
 	"github.com/chainguard-dev/clog"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/otel"
+	"gopkg.in/yaml.v3"
 
 	"chainguard.dev/melange/pkg/build"
 	"chainguard.dev/melange/pkg/config"
@@ -156,11 +160,37 @@ func scanCmd(ctx context.Context, file string, sc *scanConfig) error {
 		}
 		defer os.RemoveAll(dir)
 
+		// Run the SCA against the environment the APK was built in,
+		// rather than the one the configuration asks for, so that
+		// versioned depends name the versions that were installed.
+		bcfg := cfg
+		var resolver *apk.PkgResolver
+		env, err := recordedEnvironment(exp)
+		if err != nil {
+			return fmt.Errorf("reading .melange.yaml in %s: %w", exp.ControlFile, err)
+		}
+		if env != nil {
+			c := *cfg
+			c.Environment = *env
+			bcfg = &c
+
+			repos := []string{sc.repo}
+			for _, repo := range slices.Concat(env.Contents.Repositories, env.Contents.BuildRepositories) {
+				if !slices.Contains(repos, repo) {
+					repos = append(repos, repo)
+				}
+			}
+			resolver = scanResolver(ctx, arch, repos)
+		} else {
+			log.Warnf("%s has no .melange.yaml; versioned depends will not be generated", u)
+		}
+
 		bb := &build.Build{
 			WorkspaceDir:    dir,
 			SourceDateEpoch: time.Unix(0, 0),
-			Configuration:   cfg,
+			Configuration:   bcfg,
 			Namespace:       sc.purlNamespace,
+			PkgResolver:     resolver,
 		}
 
 		pb := build.PackageBuild{
@@ -419,6 +449,53 @@ func parsePkgInfo(in io.Reader) (*pkginfo, error) {
 	return &pkg, scanner.Err()
 }
 
+// recordedEnvironment returns the build environment recorded in the
+// .melange.yaml that melange embeds in the APKs it builds: the packages
+// that were installed, pinned to their versions, and the repositories
+// they came from.  It returns nil for an APK that has no .melange.yaml.
+func recordedEnvironment(exp *expandapk.APKExpanded) (*apko_types.ImageConfiguration, error) {
+	b, err := fs.ReadFile(exp.ControlFS, ".melange.yaml")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var cfg config.Configuration
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg.Environment, nil
+}
+
+// scanResolver returns a resolver over the indexes of repos, standing
+// in for the one a build gets from its build environment.  Like the
+// APKs scan reads, the indexes are not verified.  A repository whose
+// index can't be read, e.g. for lack of credentials, is skipped.
+func scanResolver(ctx context.Context, arch string, repos []string) *apk.PkgResolver {
+	log := clog.FromContext(ctx)
+
+	var indexes []apk.NamedIndex
+	for _, repo := range repos {
+		idx, err := apk.GetRepositoryIndexes(ctx, []string{repo}, nil, arch,
+			apk.WithIgnoreSignatures(true),
+			apk.WithHTTPClient(http.DefaultClient))
+		if err != nil {
+			log.Warnf("skipping repository %s: %v", repo, err)
+			continue
+		}
+		indexes = append(indexes, idx...)
+	}
+
+	if len(indexes) == 0 {
+		log.Warnf("no repository indexes could be read; versioned depends will not be generated")
+		return nil
+	}
+
+	return apk.NewPkgResolver(ctx, indexes)
+}
+
 // Based on pkg/build/sca_interface but swapping out dirfs for tarfs
 type scaImpl struct {
 	pb   *build.PackageBuild
@@ -476,9 +553,10 @@ func (s *scaImpl) InstalledPackages() map[string]string {
 		pkgVersionMap[pkg] = version
 	}
 
-	// We also include the packages being built.
+	// We also include the packages being built, with the special
+	// version string "@CURRENT@" that build's SCA handle uses for them.
 	for _, pkg := range s.RelativeNames() {
-		pkgVersionMap[pkg] = s.Version()
+		pkgVersionMap[pkg] = "@CURRENT@"
 	}
 
 	return pkgVersionMap
